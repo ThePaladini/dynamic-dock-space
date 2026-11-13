@@ -10,8 +10,9 @@
 </p>
 
 <p align="center">
-  <a href="README.pt-BR.md">🇧🇷 Leia em português</a> ·
-  <a href="https://github.com/ThePaladini/dynamic-dock-space/releases/latest">⬇️ Download</a>
+  <a href="https://youtube.com/shorts/hsAb6s5Nxeg">▶️ Watch the 36-second demo</a> ·
+  <a href="https://github.com/ThePaladini/dynamic-dock-space/releases/latest">⬇️ Download</a> ·
+  <a href="README.pt-BR.md">🇧🇷 Leia em português</a>
 </p>
 
 ---

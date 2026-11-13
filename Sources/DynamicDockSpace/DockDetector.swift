@@ -75,8 +75,27 @@ enum DockDetector {
         var source = "?"
         if useAX, let f = axListFrame() { screen = screenFromAX(f, edge: edge, screens); source = "AX" }
         if screen == nil, let s = cgDockScreen(screens) { screen = s; source = "CGWindow" }
-        // Nothing reserved: legitimate only when the Dock auto-hides. Otherwise the system is mid-transition
-        // (or a full-screen Space is showing on the Dock's display); acting now could expand windows wrongly.
+        // Nothing reserved while the Dock does not auto-hide: either the system is mid-transition (acting now could
+        // expand windows wrongly), or the Dock now belongs to a display showing a full-screen Space — pushing the
+        // pointer against the bottom of a full-screen video moves the Dock there, where it stays hidden. That second
+        // case is stable: every other display has no Dock and should use its whole height.
+        if !autohide, useAX, let s = screen, hasFullScreenWindow(on: s) {
+            return DockState(edge: edge, autohide: autohide, screenID: s.id, reservation: 0, source: source + " (full-screen display)", stable: true)
+        }
         return DockState(edge: edge, autohide: autohide, screenID: screen?.id, reservation: 0, source: source, stable: autohide)
+    }
+
+    /// A window in native full screen (AXFullScreen) covering this display. Only consulted in the rare
+    /// "nothing reserved" state, so enumerating apps here is cheap enough.
+    static func hasFullScreenWindow(on s: ScreenInfo) -> Bool {
+        let center = CGPoint(x: s.frame.midX, y: s.frame.midY)
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular && !app.isTerminated {
+            let ax = AXUIElementCreateApplication(app.processIdentifier)
+            AXUIElementSetMessagingTimeout(ax, 0.2)
+            for w in AX.elements(ax, kAXWindowsAttribute) where AX.bool(w, "AXFullScreen") == true {
+                if let f = AX.frame(w), f.contains(center) { return true }
+            }
+        }
+        return false
     }
 }

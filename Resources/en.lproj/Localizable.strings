@@ -1,2 +1,3 @@
 /* English is the development language: keys are the English text. Only non-literal keys need entries here. */
 "permission.explanation" = "It is used only to:\n• read the position and size of windows and of the Dock;\n• resize windows when the Dock moves to another display.\n\nNothing leaves your Mac. In System Settings › Privacy & Security › Accessibility, turn on “DynamicDockSpace”. The app notices the permission by itself — no restart needed.";
+"Repair stuck Dock space (restarts the Dock)" = "Repair stuck Dock space (restarts the Dock)";

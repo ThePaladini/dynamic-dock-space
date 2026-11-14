@@ -35,3 +35,4 @@
 "permission.explanation" = "Ela é usada apenas para:\n• ler a posição e o tamanho das janelas e da Dock;\n• redimensionar janelas quando a Dock muda de monitor.\n\nNada sai do seu Mac. Em Ajustes do Sistema › Privacidade e Segurança › Acessibilidade, ative “DynamicDockSpace”. O app detecta a permissão sozinho, sem reiniciar.";
 "reserves %d pt" = "reserva %d pt";
 "right" = "à direita";
+"Repair stuck Dock space (restarts the Dock)" = "Corrigir espaço da Dock travado (reinicia a Dock)";

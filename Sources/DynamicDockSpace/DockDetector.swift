@@ -20,6 +20,10 @@ struct DockState: Equatable {
     /// The Dock is shown on `screenID` (autohide off) but macOS reserved no space for it — seen after leaving a
     /// full-screen Space the Dock was pulled onto. The system may stay like this until something else changes.
     var shownUnreserved = false
+    /// macOS reserves the Dock's space on this display although the Dock is shown on another one. Seen after leaving
+    /// full screen on the Dock's display once the Dock had been pulled to another display; it persists until the
+    /// Dock restarts (even moving the Dock back and forth does not clear it), and native zoom leaves a strip too.
+    var staleReservationOn: CGDirectDisplayID?
 }
 
 enum DockDetector {
@@ -72,6 +76,22 @@ enum DockDetector {
         let (edge, autohide) = readPrefs()
         let reserved = screens.filter { $0.inset(edge) > reserveThreshold }
         if let s = reserved.max(by: { $0.inset(edge) < $1.inset(edge) }) {
+            // Cross-check with where the Dock really is (one ~1 ms AX call). Briefly different during every move (the
+            // icons jump ~200 ms before macOS updates the reservation), so callers wait before trusting it.
+            if !autohide, useAX, reserved.count == 1, let f = axListFrame(), let ax = screenFromAX(f, edge: edge, screens),
+               ax.id != s.id, ax.frame.insetBy(dx: -2, dy: -2).contains(f) {
+                if hasFullScreenWindow(on: ax) {
+                    // Pulled over a full-screen app: hidden there, nothing to keep clear.
+                    return DockState(edge: edge, autohide: autohide, screenID: ax.id, reservation: 0, source: "AX (full-screen display)", stable: true)
+                }
+                var st = DockState(edge: edge, autohide: autohide, screenID: ax.id, reservation: 0, source: "AX (space reserved on display \(s.id))", stable: false)
+                if hasFullScreenWindow(on: s) {
+                    st.shownUnreserved = true      // the old display is in full screen and keeps its reservation meanwhile
+                } else {
+                    st.staleReservationOn = s.id   // stuck: needs a Dock restart
+                }
+                return st
+            }
             return DockState(edge: edge, autohide: autohide, screenID: s.id, reservation: s.inset(edge), source: "visibleFrame", stable: reserved.count == 1)
         }
         var screen: ScreenInfo?

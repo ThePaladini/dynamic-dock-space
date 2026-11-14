@@ -10,7 +10,7 @@ final class Engine {
     }
     struct AppRef { let pid: pid_t; let name: String }
     struct Context {
-        let screens: [ScreenInfo]; let dock: DockState; let lastReservation: CGFloat?; let extendGlued: Bool; let scope: Planner.Scope; let apps: [AppRef]
+        let screens: [ScreenInfo]; let dock: DockState; let lastReservation: CGFloat?; let extendGlued: Bool; let scope: Planner.Scope; var apps: [AppRef]
         let pre: PreSnapshot?; let isVerification: Bool; let animate: Bool
         var onlyScreen: CGDirectDisplayID? = nil; var duration: Double = Engine.animationDuration
         let created = CFAbsoluteTimeGetCurrent()
@@ -87,7 +87,7 @@ final class Engine {
         // On the very last row macOS moves the Dock here after the pointer rests ~160 ms. Shrinking now, before the
         // Dock appears, means it lands on free space. (Chrome, when active, freezes ~0.4 s if the Dock appears over
         // its window, and then snaps it.) If the pointer leaves before the Dock moves, the edge watch undoes it.
-        if Self.isAtEdge(p, s, dock.edge) { predictEarly(s.id) }
+        // (The edge watch starts it once the pointer has rested on the last row for `edgeDwell`.)
     }
 
     static func isAtEdge(_ p: CGPoint, _ s: ScreenInfo, _ e: DockEdge) -> Bool {
@@ -105,9 +105,12 @@ final class Engine {
         lastPrediction = (target, Date()); earlyTarget = target
         predictArrival(on: target, duration: Self.earlyDuration, why: "pointer pushing against the edge of display \(target)")
     }
-    /// Starts ~160 ms before the Dock moves and must end before macOS reserves its area (~350 ms after the pointer
+    /// Starts ~100 ms before the Dock moves and must end before macOS reserves its area (~350 ms after the pointer
     /// reaches the edge): AppKit apps then clamp windows that still overlap it.
-    static let earlyDuration = 0.25
+    static let earlyDuration = 0.22
+    /// A pointer merely passing over the last row does not summon the Dock (it needs ~160 ms there): wait this long
+    /// before shrinking, so passing touches do not resize windows for nothing.
+    static let edgeDwell = 0.06
 
     static func isNearEdge(_ p: CGPoint, _ s: ScreenInfo, _ e: DockEdge) -> Bool {
         switch e {
@@ -150,7 +153,8 @@ final class Engine {
               settings.enabled, settings.animate, !isStandby, AXIsProcessTrusted(),
               settings.lastReservation(edge) != nil else { return }
         let started = Date()
-        edgeWatch = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] t in
+        var atEdgeSince: Date?
+        edgeWatch = Timer.scheduledTimer(withTimeInterval: 1.0 / 120, repeats: true) { [weak self] t in
             guard let self else { t.invalidate(); return }
             func stop() { t.invalidate(); self.edgeWatch = nil }
             guard Date().timeIntervalSince(started) < 2, let primary = self.lastScreens.first,
@@ -161,7 +165,12 @@ final class Engine {
                 self.lastPrediction = (target, Date()); self.predictArrival(on: target); return
             }
             let c = NSEvent.mouseLocation
-            if !Self.isNearEdge(CGPoint(x: c.x, y: primary.frame.height - c.y), s, edge) {
+            let p = CGPoint(x: c.x, y: primary.frame.height - c.y)
+            if Self.isAtEdge(p, s, edge) {
+                if atEdgeSince == nil { atEdgeSince = Date() }
+                if Date().timeIntervalSince(atEdgeSince!) >= Self.edgeDwell { self.predictEarly(target) }
+            } else { atEdgeSince = nil }
+            if !Self.isNearEdge(p, s, edge) {
                 stop()
                 if self.earlyTarget == target {
                     // Left the edge before the Dock moved: put the windows back.
@@ -227,6 +236,16 @@ final class Engine {
             mouseWaits += 1; schedule(reason, after: 0.25); return
         }
         mouseWaits = 0
+        if let stale = dock.staleReservationOn {
+            unstableAttempts += 1
+            // Give an ordinary Dock move time to finish first.
+            if unstableAttempts < 8 { schedule(reason, after: 0.25); return }
+            unstableAttempts = 0
+            repairs = repairs.filter { Date().timeIntervalSince($0) < 600 }
+            if settings.repairDock, repairs.count < 5, Date().timeIntervalSince(repairs.last ?? .distantPast) > 10 { repairDock(stale) }
+            else { Log.info("space still reserved on display \(stale) although the Dock is on display \(dock.screenID ?? 0); not repairing (\(settings.repairDock ? "too many recent repairs" : "disabled"))") }
+            return
+        }
         if !dock.stable {
             unstableAttempts += 1
             // Normally wait a second: during an ordinary Dock move macOS reserves the space ~200 ms late. Right after
@@ -254,6 +273,15 @@ final class Engine {
         if reason == "Space changed", dock.source.hasSuffix("(full-screen display)") {
             DispatchQueue.main.async { self.schedule("full-screen recheck", after: 1.2) }
         }
+        // The Dock changed side (bottom/left/right): first undo what was done for the old side, as if that Dock had
+        // left every display (restores shrunk windows, lets windows sized to it grow back), then fit the new side.
+        if let old = lastEdge, old != dock.edge {
+            let gone = DockState(edge: old, autohide: false, screenID: nil, reservation: 0, source: "Dock moved to another side", stable: true)
+            let undo = makeContext(screens: screens, dock: gone, verification: false)
+            Log.info("reconcile [Dock side \(old.rawValue) → \(dock.edge.rawValue)] undoing adjustments for the old side")
+            queue.async { self.reconcile(undo) }
+        }
+        lastEdge = dock.edge
         let ctx = makeContext(screens: screens, dock: dock, verification: verification)
         Log.info("reconcile [\(reason)] dock=\(dock.screenID.map(String.init) ?? "?") \(dock.edge.rawValue) R=\(Int(dock.reservation)) autohide=\(dock.autohide) via \(dock.source)")
         queue.async {
@@ -263,6 +291,30 @@ final class Engine {
                 DispatchQueue.main.async { self.schedule("verification", after: 0.8, verification: true) }
             }
         }
+    }
+
+    private var lastEdge: DockEdge?   // main
+    private var repairs: [Date] = []   // recent Dock restarts (a loop guard if a restart ever fails to clear it)
+    /// Restarting the Dock (it relaunches by itself in ~1 s) is the only way found to make macOS move a stuck
+    /// reservation; afterwards the screen-change notification brings everything back in line.
+    private func repairDock(_ stale: CGDirectDisplayID) {
+        guard let d = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else { return }
+        repairs.append(Date())
+        Log.info("macOS keeps the Dock's space reserved on display \(stale) where the Dock is not: restarting the Dock")
+        kill(d.processIdentifier, SIGTERM)
+        schedule("after Dock restart", after: 2.5)
+    }
+
+    /// Re-check one app's windows (e.g. it was activated: a window may just have been restored from the Dock with a
+    /// size from before the Dock moved). Independent of the debounced global pass.
+    func refreshApp(_ pid: pid_t) {
+        guard settings.enabled, AXIsProcessTrusted(), !isStandby, NSEvent.pressedMouseButtons == 0 else { return }
+        let dock = detect()
+        guard dock.stable else { return }
+        var ctx = makeContext(screens: lastScreens, dock: dock, verification: false)
+        ctx.apps = ctx.apps.filter { $0.pid == pid }
+        guard !ctx.apps.isEmpty else { return }
+        queue.async { self.reconcile(ctx, quiet: true) }
     }
 
     /// Forget everything (e.g. automation disabled).
@@ -275,7 +327,7 @@ final class Engine {
         let why: String; let isRetry: Bool
     }
 
-    @discardableResult private func reconcile(_ ctx: Context) -> Int {
+    @discardableResult private func reconcile(_ ctx: Context, quiet: Bool = false) -> Int {
         let t0 = CFAbsoluteTimeGetCurrent()
         records = records.filter { isRunning($0.value.pid) }
         let retries = ctx.isVerification ? pending : [:]
@@ -309,6 +361,7 @@ final class Engine {
         let seenNow = sh.seenNow, changed = sh.changed, notes = sh.notes
         lastSeen.merge(seenNow) { $1 }
         if lastSeen.count > 2000 { lastSeen = seenNow }
+        if quiet && changed == 0 { return 0 }
         Log.info(String(format: "reconcile done in %.0f ms (queued %.0f ms): %d window(s) adjusted, %d record(s)", (CFAbsoluteTimeGetCurrent() - t0) * 1000, (t0 - ctx.created) * 1000, changed, records.count) + (notes.isEmpty ? "" : "; slow: " + notes.joined(separator: ", ")))
         return changed
     }
@@ -350,6 +403,10 @@ final class Engine {
             if let r = rec, !f.approx(r.after) {
                 if let pre = ctx.pre, pre.has(app.pid, r.after) {
                     effective = r.after                      // changed by the app during the Dock move, not by the user
+                } else if Date().timeIntervalSince(r.created) < 2.5 {
+                    // Moments after our own change, while the Dock was still settling: the system/app nudged it
+                    // (e.g. clamped a few points when macOS reserved the area). Fit it again from the original size.
+                    effective = r.kind == .shrunk ? r.before : r.after
                 } else {
                     // The user changed the window after us: their choice wins, forget it.
                     Log.info("\(app.name) «\(AX.string(w, kAXTitleAttribute) ?? "")» changed since our adjustment (\(r.after.short) → \(f.short)); leaving it alone")

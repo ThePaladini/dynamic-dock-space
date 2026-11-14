@@ -66,6 +66,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         menu.addItem(ext)
         let anim = action(L("Animate resizing"), #selector(toggleAnimate)); anim.state = settings.animate ? .on : .off
         menu.addItem(anim)
+        let rep = action(L("Repair stuck Dock space (restarts the Dock)"), #selector(toggleRepair)); rep.state = settings.repairDock ? .on : .off
+        menu.addItem(rep)
 
         // Ignored apps
         let ignored = NSMenuItem(title: L("Ignored apps"), action: nil, keyEquivalent: "")
@@ -142,6 +144,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         guard let raw = sender.representedObject as? String, let sc = Planner.Scope(rawValue: raw) else { return }
         settings.scope = sc; engine.schedule("option changed", after: 0.1)
     }
+    @objc private func toggleRepair() { settings.repairDock.toggle() }
     @objc private func toggleAnimate() { settings.animate.toggle() }
     @objc private func adjustNow() { engine.schedule("manual", after: 0.05) }
     @objc private func toggleIgnore(_ sender: NSMenuItem) {

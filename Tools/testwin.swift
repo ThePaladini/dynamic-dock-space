@@ -12,7 +12,7 @@ for (i, a) in CommandLine.arguments.dropFirst().enumerated() {
     let v = parts.prefix(4).map { CGFloat(Double($0)!) }
     let r = NSRect(x: v[0], y: ph - v[1] - v[3], width: v[2], height: v[3])
     let w = NSWindow(contentRect: .zero, styleMask: [.titled, .resizable, .closable, .miniaturizable], backing: .buffered, defer: false)
-    w.title = "T\(i)"; w.isReleasedWhenClosed = false
+    w.title = ProcessInfo.processInfo.environment["PREFIX", default: "T"] + "\(i)"; w.collectionBehavior.insert(.fullScreenPrimary); w.isReleasedWhenClosed = false
     w.setFrame(r, display: true)
     w.orderFront(nil)
     wins.append(w)

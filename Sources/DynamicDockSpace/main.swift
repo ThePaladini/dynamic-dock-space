@@ -26,6 +26,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wnc.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.engine.schedule("Space changed", after: 0.4)
         }
+        // Restoring a minimized window (Dock click, Cmd-Tab) activates its app: its size may predate a Dock move.
+        wnc.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [weak self] n in
+            guard let a = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { self?.engine.refreshApp(a.processIdentifier) }
+        }
         wnc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.engine.schedule("wake", after: 2)
         }

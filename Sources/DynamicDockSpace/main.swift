@@ -19,7 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let nc = NotificationCenter.default, wnc = NSWorkspace.shared.notificationCenter
         // Fired when visibleFrame changes (Dock moves/hides/resizes), and on display connect/disconnect/arrangement.
         nc.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
-            self?.engine.schedule("displays/Dock changed", after: 0.3)
+            self?.engine.schedule("displays/Dock changed", after: 0.15)
             self?.engine.detect(); self?.menu.refreshIcon()   // standby state may have changed (display count)
         }
         // AX only lists windows of the visible Spaces: reconcile windows as their Space becomes active.

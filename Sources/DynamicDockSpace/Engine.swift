@@ -13,6 +13,8 @@ final class Engine {
         let screens: [ScreenInfo]; let dock: DockState; let lastReservation: CGFloat?; let extendGlued: Bool; let scope: Planner.Scope; let apps: [AppRef]
         let pre: PreSnapshot?; let isVerification: Bool; let animate: Bool
         var onlyScreen: CGDirectDisplayID? = nil; var duration: Double = Engine.animationDuration
+        let created = CFAbsoluteTimeGetCurrent()
+        var isPrediction: Bool { dock.source == "prediction" }
     }
     /// Window bounds captured just before an expected Dock move (no AX, ~1 ms).
     struct PreSnapshot { let at: Date; let windows: [(pid: pid_t, bounds: CGRect)]
@@ -82,7 +84,30 @@ final class Engine {
             pre = PreSnapshot(at: Date(), windows: wins)
         }
         startEdgeWatch(s.id, dock.edge)
+        // On the very last row macOS moves the Dock here after the pointer rests ~160 ms. Shrinking now, before the
+        // Dock appears, means it lands on free space. (Chrome, when active, freezes ~0.4 s if the Dock appears over
+        // its window, and then snaps it.) If the pointer leaves before the Dock moves, the edge watch undoes it.
+        if Self.isAtEdge(p, s, dock.edge) { predictEarly(s.id) }
     }
+
+    static func isAtEdge(_ p: CGPoint, _ s: ScreenInfo, _ e: DockEdge) -> Bool {
+        switch e {
+        case .bottom: return p.y >= s.frame.maxY - 1
+        case .left: return p.x <= s.frame.minX + 1
+        case .right: return p.x >= s.frame.maxX - 1
+        }
+    }
+
+    private func predictEarly(_ target: CGDirectDisplayID) {
+        if let p = lastPrediction, p.target == target, Date().timeIntervalSince(p.at) < 2 { return }
+        guard let dock = lastDock, settings.enabled, settings.animate, !isStandby, AXIsProcessTrusted(),
+              settings.lastReservation(dock.edge) != nil else { return }
+        lastPrediction = (target, Date()); earlyTarget = target
+        predictArrival(on: target, duration: Self.earlyDuration, why: "pointer pushing against the edge of display \(target)")
+    }
+    /// Starts ~160 ms before the Dock moves and must end before macOS reserves its area (~350 ms after the pointer
+    /// reaches the edge): AppKit apps then clamp windows that still overlap it.
+    static let earlyDuration = 0.25
 
     static func isNearEdge(_ p: CGPoint, _ s: ScreenInfo, _ e: DockEdge) -> Bool {
         switch e {
@@ -117,8 +142,10 @@ final class Engine {
     /// While the pointer rests on the Dock edge of a display without the Dock, watch (≤2 s, 60 Hz, one ~1 ms AX
     /// call) for the Dock starting to move there. Its AXList jumps to the new display ~200 ms before visibleFrame
     /// changes — which is what makes every app clamp its windows abruptly. Shrinking first lets us animate it.
+    private var earlyTarget: CGDirectDisplayID?   // early prediction made, Dock not seen moving yet
+
     private func startEdgeWatch(_ target: CGDirectDisplayID, _ edge: DockEdge) {
-        if let p = lastPrediction, p.target == target, Date().timeIntervalSince(p.at) < 2 { return }
+        if let p = lastPrediction, p.target == target, Date().timeIntervalSince(p.at) < 2, earlyTarget != target { return }
         guard edgeWatch == nil,
               settings.enabled, settings.animate, !isStandby, AXIsProcessTrusted(),
               settings.lastReservation(edge) != nil else { return }
@@ -129,23 +156,34 @@ final class Engine {
             guard Date().timeIntervalSince(started) < 2, let primary = self.lastScreens.first,
                   let s = self.lastScreens.first(where: { $0.id == target }) else { stop(); return }
             if let f = DockDetector.axListFrame(), DockDetector.screenFromAX(f, edge: edge, self.lastScreens)?.id == target {
-                stop(); self.lastPrediction = (target, Date()); self.predictArrival(on: target); return
+                stop()
+                if self.earlyTarget == target { self.earlyTarget = nil; return }   // already shrunk ahead of the Dock
+                self.lastPrediction = (target, Date()); self.predictArrival(on: target); return
             }
             let c = NSEvent.mouseLocation
-            if !Self.isNearEdge(CGPoint(x: c.x, y: primary.frame.height - c.y), s, edge) { stop() }
+            if !Self.isNearEdge(CGPoint(x: c.x, y: primary.frame.height - c.y), s, edge) {
+                stop()
+                if self.earlyTarget == target {
+                    // Left the edge before the Dock moved: put the windows back.
+                    self.earlyTarget = nil; self.lastPrediction = nil
+                    Log.info("pointer left the edge before the Dock moved; undoing the early shrink")
+                    self.schedule("early shrink cancelled", after: 0.15)
+                }
+            }
         }
     }
 
     /// Shrink windows on the display the Dock is arriving at, using the Dock thickness learned before.
-    private func predictArrival(on target: CGDirectDisplayID) {
+    private func predictArrival(on target: CGDirectDisplayID, duration: Double = 0.2, why: String? = nil) {
         guard let dock = lastDock, let R = settings.lastReservation(dock.edge),
               let s = lastScreens.first(where: { $0.id == target }), NSEvent.pressedMouseButtons == 0 else { return }
         let screens = Self.reserving(R, dock.edge, on: s, in: lastScreens)
+        // Only the arriving side: until macOS frees the area the Dock leaves, apps refuse to grow into it.
         let predicted = DockState(edge: dock.edge, autohide: false, screenID: target, reservation: R, source: "prediction", stable: true)
         var ctx = makeContext(screens: screens, dock: predicted, verification: false)
         ctx.onlyScreen = target
-        ctx.duration = 0.2
-        Log.info("reconcile [prediction] Dock arriving on display \(target)")
+        ctx.duration = duration
+        Log.info("reconcile [prediction] " + (why ?? "Dock arriving on display \(target)"))
         queue.async { self.reconcile(ctx) }
         // If the move does not complete, the regular pass (or this fallback) puts things back.
         schedule("prediction check", after: 1.0)
@@ -238,102 +276,131 @@ final class Engine {
     }
 
     @discardableResult private func reconcile(_ ctx: Context) -> Int {
+        let t0 = CFAbsoluteTimeGetCurrent()
         records = records.filter { isRunning($0.value.pid) }
         let retries = ctx.isVerification ? pending : [:]
         pending.removeAll()
-        var seenNow: [WinKey: CGRect] = [:]
-        var jobs: [Job] = []
-        var enhancedOff: [AXUIElement] = []
-
-        // 1. Plan every window (reads only).
-        for app in ctx.apps {
+        // Every app runs its own pipeline (read → plan → animate → apply) in parallel: an app that is slow to answer
+        // (often the active one, busy with the pointer) only delays itself, not the windows of every other app.
+        let sh = Shared()
+        DispatchQueue.concurrentPerform(iterations: ctx.apps.count) { i in
+            let app = ctx.apps[i]
+            let ta = CFAbsoluteTimeGetCurrent()
+            let jobs = planApp(app, ctx, retries, sh)
+            let planned = CFAbsoluteTimeGetCurrent()
+            if planned - ta > 0.05 { sh.lock.lock(); sh.notes.append(String(format: "%@ answered in %.0f ms", app.name, (planned - ta) * 1000)); sh.lock.unlock() }
+            guard !jobs.isEmpty else { return }
             let axApp = AXUIElementCreateApplication(app.pid)
-            AXUIElementSetMessagingTimeout(axApp, 0.5)   // a hung app must not stall us
-            let jobsBefore = jobs.count
-            for w in AX.elements(axApp, kAXWindowsAttribute) {
-                guard AX.string(w, kAXRoleAttribute) == kAXWindowRole,
-                      AX.string(w, kAXSubroleAttribute) == kAXStandardWindowSubrole,
-                      AX.bool(w, kAXMinimizedAttribute) != true,
-                      AX.bool(w, "AXFullScreen") != true,
-                      let f = AX.frame(w), f.width > 1, f.height > 1,
-                      let s = Screens.screen(for: f, in: ctx.screens) else { continue }
-                if let ot = onlyTitle, !(AX.string(w, kAXTitleAttribute) ?? "").contains(ot) { continue }
-                let key = WinKey(el: w)
-                seenNow[key] = f
-                if let only = ctx.onlyScreen, s.id != only { continue }
-                if let p = retries[key], f.approx(p.seen) {
-                    // Untouched since the app overrode us: apply the intended frame again.
-                    jobs.append(Job(app: app, w: w, key: key, title: AX.string(w, kAXTitleAttribute) ?? "", from: f, target: p.target,
-                                    kind: p.kind, before: p.before, effective: f, screenID: p.screenID,
-                                    why: "app undid the change; reapplied", isRetry: true))
-                    continue
-                }
-                var rec = records[key]
-                // `effective` = the frame the window had before the system/app reacted to this transition.
-                var effective = f
-                if let r = rec, !f.approx(r.after) {
-                    if let pre = ctx.pre, pre.has(app.pid, r.after) {
-                        effective = r.after                      // changed by the app during the Dock move, not by the user
-                    } else {
-                        // The user changed the window after us: their choice wins, forget it.
-                        Log.info("\(app.name) «\(AX.string(w, kAXTitleAttribute) ?? "")» changed since our adjustment (\(r.after.short) → \(f.short)); leaving it alone")
-                        records[key] = nil; rec = nil
-                    }
-                } else if rec == nil, let last = lastSeen[key], !f.approx(last), let pre = ctx.pre, pre.has(app.pid, last) {
-                    effective = last                             // app auto-clamped it during the Dock move
-                }
-                guard let d = Planner.plan(frame: effective, screen: s, dock: ctx.dock, record: rec,
-                                           lastReservation: ctx.lastReservation, extendGlued: ctx.extendGlued, scope: ctx.scope),
-                      !d.target.approx(f, tol: 0.5),
-                      AX.isSettable(w, kAXSizeAttribute) else { continue }
-                let title = AX.string(w, kAXTitleAttribute) ?? ""
-                if dryRun {
-                    Log.info("[dry-run] \(app.name) «\(title)» \(f.short) → \(d.target.short) — \(d.why)"); continue
-                }
-                let before = (d.kind != nil && rec?.kind == d.kind) ? rec!.before : effective   // keep the original size on retries
-                jobs.append(Job(app: app, w: w, key: key, title: title, from: f, target: d.target, kind: d.kind,
-                                before: before, effective: effective, screenID: s.id, why: d.why, isRetry: false))
-            }
-            if jobs.count > jobsBefore, AX.bool(axApp, "AXEnhancedUserInterface") == true {
+            AXUIElementSetMessagingTimeout(axApp, 0.5)
+            var enhanced = false
+            if AX.bool(axApp, "AXEnhancedUserInterface") == true {
                 // Chromium/Electron animate AX resizes while this is on; turn it off during the change.
-                AX.setBool(axApp, "AXEnhancedUserInterface", false); enhancedOff.append(axApp)
+                AX.setBool(axApp, "AXEnhancedUserInterface", false); enhanced = true
             }
+            defer { if enhanced { AX.setBool(axApp, "AXEnhancedUserInterface", true) } }
+            if ctx.animate {
+                // A prediction must end before macOS reserves the Dock area (apps then clamp their windows): an app
+                // that answered late gets a shorter animation rather than a cut-off one.
+                let duration = ctx.isPrediction ? max(0.12, ctx.duration - (planned - ctx.created)) : ctx.duration
+                animate(jobs, duration: duration)
+            }
+            for j in jobs { finish(j, ctx, sh) }
         }
-        defer { for a in enhancedOff { AX.setBool(a, "AXEnhancedUserInterface", true) } }
-
-        // 2. Animate all windows together, 3. then set the exact final frame and record the outcome.
-        if ctx.animate { animate(jobs, duration: ctx.duration) }
-        var changed = 0
-        for j in jobs {
-            let err = apply(j.w, from: AX.frame(j.w) ?? j.from, to: j.target)
-            let actual = AX.frame(j.w) ?? j.target
-            seenNow[j.key] = actual
-            changed += 1
-            if j.isRetry {
-                if let k = j.kind {
-                    records[j.key] = Planner.Record(pid: j.app.pid, kind: k, before: j.before, after: actual, screenID: j.screenID, created: Date())
-                } else { records[j.key] = nil }
-                Log.info("\(j.app.name) «\(j.title)» \(j.why) → \(actual.short)")
-                continue
-            }
-            if !actual.approx(j.target) {
-                // The app is still reacting to the screen change (or enforces a min size): retry once later.
-                pending[j.key] = Pending(target: j.target, kind: j.kind, before: j.before, seen: actual, pid: j.app.pid, screenID: j.screenID)
-                if err != .success { Log.info("\(j.app.name) «\(j.title)» AXError \(err.rawValue)") }
-            }
-            if actual.approx(j.from, tol: 0.5) { continue }   // no effect at all: state unchanged
-            if let k = j.kind {
-                records[j.key] = Planner.Record(pid: j.app.pid, kind: k, before: j.before, after: actual, screenID: j.screenID, created: Date())
-            } else {
-                records[j.key] = nil
-            }
-            Log.info("\(j.app.name) «\(j.title)» \(j.from.short)\(j.effective == j.from ? "" : " [before: \(j.effective.short)]") → \(actual.short) — \(j.why)" + (actual.approx(j.target) ? "" : " (app limited it to \(actual.short))"))
-        }
-        // Keep last-seen frames for visible windows; windows on other Spaces keep their previous entry.
+        let seenNow = sh.seenNow, changed = sh.changed, notes = sh.notes
         lastSeen.merge(seenNow) { $1 }
         if lastSeen.count > 2000 { lastSeen = seenNow }
-        Log.info("reconcile done: \(changed) window(s) adjusted, \(records.count) record(s)")
+        Log.info(String(format: "reconcile done in %.0f ms (queued %.0f ms): %d window(s) adjusted, %d record(s)", (CFAbsoluteTimeGetCurrent() - t0) * 1000, (t0 - ctx.created) * 1000, changed, records.count) + (notes.isEmpty ? "" : "; slow: " + notes.joined(separator: ", ")))
         return changed
+    }
+
+    /// State shared by the per-app pipelines of one pass. `lock` also guards `records`, `pending` and `lastSeen`.
+    private final class Shared {
+        let lock = NSLock()
+        var seenNow: [WinKey: CGRect] = [:]
+        var changed = 0
+        var notes: [String] = []
+    }
+
+    /// Reads one app's windows and decides what to change (AX reads only).
+    private func planApp(_ app: AppRef, _ ctx: Context, _ retries: [WinKey: Pending], _ sh: Shared) -> [Job] {
+        let lock = sh.lock
+        var jobs: [Job] = []
+        let axApp = AXUIElementCreateApplication(app.pid)
+        AXUIElementSetMessagingTimeout(axApp, 0.5)   // a hung app must not stall us
+        for w in AX.elements(axApp, kAXWindowsAttribute) {
+            guard AX.string(w, kAXRoleAttribute) == kAXWindowRole,
+                  AX.string(w, kAXSubroleAttribute) == kAXStandardWindowSubrole,
+                  AX.bool(w, kAXMinimizedAttribute) != true,
+                  AX.bool(w, "AXFullScreen") != true,
+                  let f = AX.frame(w), f.width > 1, f.height > 1,
+                  let s = Screens.screen(for: f, in: ctx.screens) else { continue }
+            if let ot = onlyTitle, !(AX.string(w, kAXTitleAttribute) ?? "").contains(ot) { continue }
+            let key = WinKey(el: w)
+            lock.lock(); sh.seenNow[key] = f; let last = lastSeen[key]; var rec = records[key]; lock.unlock()
+            if let only = ctx.onlyScreen, s.id != only { continue }
+            if let p = retries[key], f.approx(p.seen) {
+                // Untouched since the app overrode us: apply the intended frame again.
+                jobs.append(Job(app: app, w: w, key: key, title: AX.string(w, kAXTitleAttribute) ?? "", from: f, target: p.target,
+                                kind: p.kind, before: p.before, effective: f, screenID: p.screenID,
+                                why: "app undid the change; reapplied", isRetry: true))
+                continue
+            }
+            // `effective` = the frame the window had before the system/app reacted to this transition.
+            var effective = f
+            if let r = rec, !f.approx(r.after) {
+                if let pre = ctx.pre, pre.has(app.pid, r.after) {
+                    effective = r.after                      // changed by the app during the Dock move, not by the user
+                } else {
+                    // The user changed the window after us: their choice wins, forget it.
+                    Log.info("\(app.name) «\(AX.string(w, kAXTitleAttribute) ?? "")» changed since our adjustment (\(r.after.short) → \(f.short)); leaving it alone")
+                    lock.lock(); records[key] = nil; lock.unlock(); rec = nil
+                }
+            } else if rec == nil, let last, !f.approx(last), let pre = ctx.pre, pre.has(app.pid, last) {
+                effective = last                             // app auto-clamped it during the Dock move
+            }
+            guard let d = Planner.plan(frame: effective, screen: s, dock: ctx.dock, record: rec,
+                                       lastReservation: ctx.lastReservation, extendGlued: ctx.extendGlued, scope: ctx.scope),
+                  !d.target.approx(f, tol: 0.5),
+                  AX.isSettable(w, kAXSizeAttribute) else { continue }
+            let title = AX.string(w, kAXTitleAttribute) ?? ""
+            if dryRun {
+                Log.info("[dry-run] \(app.name) «\(title)» \(f.short) → \(d.target.short) — \(d.why)"); continue
+            }
+            let before = (d.kind != nil && rec?.kind == d.kind) ? rec!.before : effective   // keep the original size on retries
+            jobs.append(Job(app: app, w: w, key: key, title: title, from: f, target: d.target, kind: d.kind,
+                            before: before, effective: effective, screenID: s.id, why: d.why, isRetry: false))
+        }
+        return jobs
+    }
+
+    /// Sets the exact final frame and records the outcome.
+    private func finish(_ j: Job, _ ctx: Context, _ sh: Shared) {
+        // Ahead of the Dock, Chromium/Electron refuse to grow into the area macOS still reserves: no nudging then,
+        // the regular pass grows them once the area is free.
+        let err = apply(j.w, from: AX.frame(j.w) ?? j.from, to: j.target, nudge: !ctx.isPrediction)
+        let actual = AX.frame(j.w) ?? j.target
+        sh.lock.lock(); defer { sh.lock.unlock() }
+        sh.seenNow[j.key] = actual
+        sh.changed += 1
+        if j.isRetry {
+            if let k = j.kind {
+                records[j.key] = Planner.Record(pid: j.app.pid, kind: k, before: j.before, after: actual, screenID: j.screenID, created: Date())
+            } else { records[j.key] = nil }
+            Log.info("\(j.app.name) «\(j.title)» \(j.why) → \(actual.short)")
+            return
+        }
+        if !actual.approx(j.target) {
+            // The app is still reacting to the screen change (or enforces a min size): retry once later.
+            pending[j.key] = Pending(target: j.target, kind: j.kind, before: j.before, seen: actual, pid: j.app.pid, screenID: j.screenID)
+            if err != .success { Log.info("\(j.app.name) «\(j.title)» AXError \(err.rawValue)") }
+        }
+        if actual.approx(j.from, tol: 0.5) { return }   // no effect at all: state unchanged
+        if let k = j.kind {
+            records[j.key] = Planner.Record(pid: j.app.pid, kind: k, before: j.before, after: actual, screenID: j.screenID, created: Date())
+        } else {
+            records[j.key] = nil
+        }
+        Log.info("\(j.app.name) «\(j.title)» \(j.from.short)\(j.effective == j.from ? "" : " [before: \(j.effective.short)]") → \(actual.short) — \(j.why)" + (actual.approx(j.target) ? "" : " (app limited it to \(actual.short))"))
     }
 
     static let animationDuration: Double = 0.3
@@ -350,18 +417,22 @@ final class Engine {
         DispatchQueue.concurrentPerform(iterations: groups.count) { g in
             let group = groups[g]
             var last = group.map(\.from)
-            var steps = 0, total = 0.0, worst = 0.0, bailed = false
+            var done = Set<Int>()                 // windows the app resized by itself while it was stalled
+            var paused = 0.0                      // time the app spent stalled; the animation clock stops meanwhile
+            var steps = 0, total = 0.0, worst = 0.0, stalls = 0, bailed = false
             defer {
-                let line = String(format: "%@ ×%d: %d steps, avg %.1f ms, max %.1f ms%@", group[0].app.name, group.count, steps,
-                                  steps > 0 ? total / Double(steps) * 1000 : 0, worst * 1000, bailed ? ", too slow → jumped to the end" : "")
+                let line = String(format: "%@ ×%d: %d steps, avg %.1f ms, max %.1f ms%@%@", group[0].app.name, group.count, steps,
+                                  steps > 0 ? total / Double(steps) * 1000 : 0, worst * 1000,
+                                  stalls > 0 ? String(format: ", %d stall(s) waited out (%.0f ms)", stalls, paused * 1000) : "",
+                                  bailed ? ", unresponsive → jumped to the end" : "")
                 statsLock.lock(); stats.append(line); statsLock.unlock()
             }
             while true {
                 let frameStart = CFAbsoluteTimeGetCurrent()
-                let t = (frameStart - start) / duration
-                if t >= 1 { break }
+                let t = (frameStart - start - paused) / duration
+                if t >= 1 || done.count == group.count { break }
                 let e = 1 - pow(1 - t, 3)   // ease-out cubic
-                for (k, j) in group.enumerated() {
+                for (k, j) in group.enumerated() where !done.contains(k) {
                     let r = CGRect(x: (j.from.minX + (j.target.minX - j.from.minX) * e).rounded(),
                                    y: (j.from.minY + (j.target.minY - j.from.minY) * e).rounded(),
                                    width: (j.from.width + (j.target.width - j.from.width) * e).rounded(),
@@ -378,8 +449,18 @@ final class Engine {
                 }
                 let spent = CFAbsoluteTimeGetCurrent() - frameStart
                 steps += 1; total += spent; worst = max(worst, spent)
-                // An app this slow would only show a couple of jerky steps: let it jump to the end instead.
-                if spent > 0.08 { bailed = true; break }
+                if spent > 0.08 {
+                    // The app stopped responding for a moment. Chrome does this for ~0.3–0.5 s when it is the active app
+                    // and the Dock arrives on its display. Jumping to the end would show as a snap: instead stop the
+                    // clock for the stall and carry on from where the window is, unless the app resized it meanwhile.
+                    stalls += 1
+                    paused += spent - 1.0 / 120
+                    if spent > 1 || paused > 1.5 { bailed = true; break }
+                    for (k, j) in group.enumerated() where !done.contains(k) {
+                        if let f = AX.frame(j.w), f.approx(j.target, tol: 1) || !f.approx(last[k], tol: 2) { done.insert(k) }
+                    }
+                    continue
+                }
                 if spent < 1.0 / 120 { usleep(useconds_t((1.0 / 120 - spent) * 1_000_000)) }
             }
         }
@@ -393,8 +474,9 @@ final class Engine {
     /// Chromium-based apps (Chrome, VS Code, Electron) apply AX resizes asynchronously, clamp sizes that would cross
     /// the display edge, and drop a request equal to the size they last *requested* even when the real size differs.
     /// So verify after a short wait and, if needed, nudge with a 1 pt different size before the exact one.
-    @discardableResult private func apply(_ w: AXUIElement, from f: CGRect, to t: CGRect) -> AXError {
+    @discardableResult private func apply(_ w: AXUIElement, from f: CGRect, to t: CGRect, nudge: Bool = true) -> AXError {
         let err = setFrame(w, from: f, to: t)
+        if !nudge { return err }
         if let now = AX.frame(w), now.approx(t, tol: 1) { return err }
         usleep(40_000)   // async apps
         guard let now = AX.frame(w), !now.approx(t, tol: 1) else { return err }

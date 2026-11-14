@@ -17,6 +17,9 @@ struct DockState: Equatable {
     var source: String
     /// False while the system is in an inconsistent/transitional state (Dock visible but nothing reserved).
     var stable: Bool
+    /// The Dock is shown on `screenID` (autohide off) but macOS reserved no space for it — seen after leaving a
+    /// full-screen Space the Dock was pulled onto. The system may stay like this until something else changes.
+    var shownUnreserved = false
 }
 
 enum DockDetector {
@@ -73,7 +76,8 @@ enum DockDetector {
         }
         var screen: ScreenInfo?
         var source = "?"
-        if useAX, let f = axListFrame() { screen = screenFromAX(f, edge: edge, screens); source = "AX" }
+        var list: CGRect?
+        if useAX, let f = axListFrame() { list = f; screen = screenFromAX(f, edge: edge, screens); source = "AX" }
         if screen == nil, let s = cgDockScreen(screens) { screen = s; source = "CGWindow" }
         // Nothing reserved while the Dock does not auto-hide: either the system is mid-transition (acting now could
         // expand windows wrongly), or the Dock now belongs to a display showing a full-screen Space — pushing the
@@ -82,7 +86,10 @@ enum DockDetector {
         if !autohide, useAX, let s = screen, hasFullScreenWindow(on: s) {
             return DockState(edge: edge, autohide: autohide, screenID: s.id, reservation: 0, source: source + " (full-screen display)", stable: true)
         }
-        return DockState(edge: edge, autohide: autohide, screenID: screen?.id, reservation: 0, source: source, stable: autohide)
+        var st = DockState(edge: edge, autohide: autohide, screenID: screen?.id, reservation: 0, source: source, stable: autohide)
+        // The icon strip lies inside the display (a hidden Dock parks it past the edge).
+        if !autohide, let s = screen, let f = list, s.frame.insetBy(dx: -2, dy: -2).contains(f) { st.shownUnreserved = true }
+        return st
     }
 
     /// A window in native full screen (AXFullScreen) covering this display. Only consulted in the rare

@@ -41,6 +41,7 @@ final class Engine {
     private var lastPreAt = Date.distantPast
     private var unstableAttempts = 0
     private var mouseWaits = 0
+    private var leftFullScreenOn: CGDirectDisplayID?        // main
 
     init(settings: Settings) { self.settings = settings }
 
@@ -136,15 +137,7 @@ final class Engine {
     private func predictArrival(on target: CGDirectDisplayID) {
         guard let dock = lastDock, let R = settings.lastReservation(dock.edge),
               let s = lastScreens.first(where: { $0.id == target }), NSEvent.pressedMouseButtons == 0 else { return }
-        let v = s.visible, f = s.frame
-        let vis: CGRect
-        switch dock.edge {
-        case .bottom: vis = CGRect(x: v.minX, y: v.minY, width: v.width, height: f.maxY - R - v.minY)
-        case .left: vis = CGRect(x: f.minX + R, y: v.minY, width: v.maxX - f.minX - R, height: v.height)
-        case .right: vis = CGRect(x: v.minX, y: v.minY, width: f.maxX - R - v.minX, height: v.height)
-        }
-        let synth = ScreenInfo(id: s.id, name: s.name, frame: f, visible: vis, isBuiltin: s.isBuiltin)
-        let screens = lastScreens.map { $0.id == target ? synth : $0 }
+        let screens = Self.reserving(R, dock.edge, on: s, in: lastScreens)
         let predicted = DockState(edge: dock.edge, autohide: false, screenID: target, reservation: R, source: "prediction", stable: true)
         var ctx = makeContext(screens: screens, dock: predicted, verification: false)
         ctx.onlyScreen = target
@@ -153,6 +146,12 @@ final class Engine {
         queue.async { self.reconcile(ctx) }
         // If the move does not complete, the regular pass (or this fallback) puts things back.
         schedule("prediction check", after: 1.0)
+    }
+
+    /// `screens` with the Dock thickness `R` taken out of display `s`'s usable area.
+    static func reserving(_ R: CGFloat, _ edge: DockEdge, on s: ScreenInfo, in screens: [ScreenInfo]) -> [ScreenInfo] {
+        let synth = ScreenInfo(id: s.id, name: s.name, frame: s.frame, visible: Planner.usable(s, edge, dock: R), isBuiltin: s.isBuiltin)
+        return screens.map { $0.id == s.id ? synth : $0 }
     }
 
     private func makeContext(screens: [ScreenInfo], dock: DockState, verification: Bool) -> Context {
@@ -172,8 +171,13 @@ final class Engine {
     }
 
     private func fire(_ reason: String, verification: Bool = false) {
-        let dock = detect()
-        let screens = lastScreens
+        let previous = lastDock
+        var dock = detect()
+        var screens = lastScreens
+        // The Dock was on a full-screen display that is now an ordinary one: full screen was just exited there.
+        if let p = previous, p.source.hasSuffix("(full-screen display)"), !dock.source.hasSuffix("(full-screen display)") {
+            leftFullScreenOn = p.screenID
+        }
         if dock.reservation > 0 { settings.setLastReservation(dock.reservation, dock.edge) }
         guard settings.enabled, AXIsProcessTrusted() else { return }
         guard !isStandby else { Log.info("standby: only one display connected"); return }
@@ -182,13 +186,33 @@ final class Engine {
             mouseWaits += 1; schedule(reason, after: 0.25); return
         }
         mouseWaits = 0
-        guard dock.stable else {
+        if !dock.stable {
             unstableAttempts += 1
-            if unstableAttempts <= 12 { schedule(reason, after: 0.25) }
-            else { Log.info("Dock state undetermined (\(dock)); nothing changed"); unstableAttempts = 0 }
-            return
+            // Normally wait a second: during an ordinary Dock move macOS reserves the space ~200 ms late. Right after
+            // leaving full screen on the Dock's display it never does, so act at once.
+            let justLeft = dock.screenID != nil && dock.screenID == leftFullScreenOn
+            if unstableAttempts > 4 || justLeft, dock.shownUnreserved, let id = dock.screenID, let R = settings.lastReservation(dock.edge),
+               let s = screens.first(where: { $0.id == id }) {
+                // The Dock has been shown on this display for over a second and macOS still reserves nothing for it
+                // (e.g. after leaving a full-screen Space the Dock had been pulled onto), so apps are not kept clear
+                // of it. Act as if the usual thickness were reserved; once macOS catches up nothing else changes.
+                Log.info("Dock shown on display \(id) but no space reserved by macOS; assuming \(Int(R)) pt")
+                screens = Self.reserving(R, dock.edge, on: s, in: screens)
+                dock.reservation = R; dock.stable = true; dock.source += " (assumed reservation)"
+                leftFullScreenOn = nil
+            } else {
+                if unstableAttempts <= 12 { schedule(reason, after: 0.25) }
+                else { Log.info("Dock state undetermined (\(dock)); nothing changed"); unstableAttempts = 0 }
+                return
+            }
         }
         unstableAttempts = 0
+        if !dock.source.hasSuffix("(assumed reservation)"), !dock.source.hasSuffix("(full-screen display)") { leftFullScreenOn = nil }
+        // Leaving full screen also changes the Space; if the window was still finishing its exit animation, look
+        // again once it is done (the Dock is then shown on that display, often with nothing reserved).
+        if reason == "Space changed", dock.source.hasSuffix("(full-screen display)") {
+            DispatchQueue.main.async { self.schedule("full-screen recheck", after: 1.2) }
+        }
         let ctx = makeContext(screens: screens, dock: dock, verification: verification)
         Log.info("reconcile [\(reason)] dock=\(dock.screenID.map(String.init) ?? "?") \(dock.edge.rawValue) R=\(Int(dock.reservation)) autohide=\(dock.autohide) via \(dock.source)")
         queue.async {

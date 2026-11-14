@@ -34,7 +34,8 @@ With several displays (and *Displays have separate Spaces* on, the macOS default
 
 It works with the real Apple Dock — nothing is replaced, restyled or re-created — and never uses macOS full screen.
 
-- 🎞 **Smooth, animated resizing.** When the Dock is about to arrive, windows shrink *before* macOS changes the usable area, so apps don't snap them abruptly.
+- 🎞 **Smooth, animated resizing.** When the Dock is about to arrive, windows shrink *before* the Dock appears, so apps don't snap them abruptly.
+- 🩹 **Repairs a macOS glitch.** macOS can keep the Dock's space reserved on a display the Dock already left (even native zoom then leaves a strip). The app detects it and restarts the Dock, which clears it.
 - 🧠 **Respects you.** If you resize or move a window after it was adjusted, your choice wins. Nothing happens while a mouse button is held down.
 - 🙈 **Leaves alone** minimized and full-screen windows, panels and dialogs, and any app you exclude.
 - 🪶 **Lightweight.** Event-driven, no polling. Measured on an M4 Pro: 0 % CPU when you aren't using the computer, ~1 % of one core while the mouse moves (to anticipate the Dock), ~35 ms of CPU per Dock move, ~25–45 MB of memory.
@@ -50,6 +51,7 @@ It works with the real Apple Dock — nothing is replaced, restyled or re-create
   - *Maximized and attached to the Dock* (default) — also tiled halves/thirds
   - *Also moved windows that reach the Dock area* — also windows you dragged down a bit
 - **Expand windows on displays without the Dock** · **Animate resizing**
+- **Repair stuck Dock space (restarts the Dock)**
 - **Ignored apps** — ignore the frontmost app or pick from running apps
 - **Launch at login**
 
@@ -101,7 +103,11 @@ Everything below was measured on macOS 26 before writing the engine (the prototy
 
 **Engine.** Each event (display/Dock change, Space change, wake) triggers an idempotent, state-based *reconcile* over all standard windows via the Accessibility API. Every change keeps a *before/after* record, so moving the Dock back restores the exact previous frames, and a window that changed afterwards is considered yours and left alone.
 
-**Racing the apps.** When `visibleFrame` changes, every AppKit app clamps its own tall windows — instantly and without keeping their top edge. So, while the pointer rests on the bottom edge of a display without the Dock, the app watches the Dock's `AXList` (60 Hz, at most 2 s). It jumps to the new display ~200 ms *before* `visibleFrame` changes, which is enough time to animate the shrink first. A verification pass 0.8 s later re-applies anything an app undid.
+**Racing the apps.** When `visibleFrame` changes, every AppKit app clamps its own tall windows — instantly and without keeping their top edge. macOS moves the Dock after the pointer has rested ~160 ms on the last row of a display, and reserves its area ~190 ms after that. So once the pointer has rested 60 ms on that row, the app starts a 0.22 s shrink, which ends before the Dock appears. If the pointer leaves before the Dock moves, the windows go back. Watching the Dock's `AXList`, which jumps to the new display ~200 ms before `visibleFrame` changes, remains the fallback. A verification pass 0.8 s later re-applies anything an app undid. Apps refuse to *grow* into an area macOS still reserves, so windows on the display the Dock left grow as soon as macOS frees it.
+
+**Every app on its own.** Each app is read, planned, animated and applied on its own thread, so an app that is slow to answer (often the active one) only delays itself. A step that stalls stops the animation clock instead of ending it with a jump.
+
+**macOS glitches handled.** After leaving full screen on the display the Dock had been pulled onto, macOS shows the Dock but reserves no space: the usual thickness is assumed. After leaving full screen on the Dock's display once the Dock was pulled to another one, macOS keeps the reservation on the old display until the Dock restarts: the app detects the mismatch with the `AXList` and restarts the Dock (at most 5 times in 10 minutes; can be turned off). A scripted suite (`Tools/edge-cases.sh`) covers 17 scenarios: full screen on either or both displays, the Dock pulled onto full screen, minimizing, quick moves, auto-hide, Dock side and size changes, tiles.
 
 **Chromium/Electron quirks** (Chrome, VS Code, Slack…): resizes are applied asynchronously, sizes crossing the display edge are clamped, and a request equal to the last *requested* size is ignored. The engine verifies each change and, if needed, nudges with a 1 pt different size first.
 
@@ -112,8 +118,9 @@ Everything below was measured on macOS 26 before writing the engine (the prototy
 - Windows in Spaces that aren't visible are adjusted when you switch to that Space (the Accessibility API only lists visible Spaces).
 - When the Dock changes without the pointer (toggling auto-hide, plugging in a display) there is no early warning, so apps may clamp first and the final adjustment lands ~0.8 s later.
 - Several windows of the *same* app animate with fewer frames (one process re-lays out all of them).
+- A page that does heavy work on every mouse move (e.g. YouTube playing in the active Chrome tab) can freeze the app for ~0.3 s; its window may then jump instead of animating. Slow apps (WhatsApp redraws at ~20 fps) animate with fewer frames.
 - With *Displays have separate Spaces* turned off the Dock never changes display, so there is nothing to do.
-- Side Docks (left/right) are handled by the code but were only tested with the bottom Dock.
+- Side Docks (left/right) are covered by the scripted scenarios but rarely used day to day.
 
 ## Project layout
 

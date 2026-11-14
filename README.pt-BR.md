@@ -34,7 +34,8 @@ Com vários monitores (e *Monitores com Spaces separados* ligado, o padrão do m
 
 Funciona com a Dock original da Apple, sem substituir, alterar o visual ou recriar nada, e nunca usa a tela cheia do macOS.
 
-- 🎞 **Redimensionamento animado e suave.** Quando a Dock está para chegar, as janelas encolhem *antes* de o macOS mudar a área útil, então os apps não as cortam de forma brusca.
+- 🎞 **Redimensionamento animado e suave.** Quando a Dock está para chegar, as janelas encolhem *antes* de ela aparecer, então os apps não as cortam de forma brusca.
+- 🩹 **Corrige uma falha do macOS.** O macOS às vezes continua reservando o espaço da Dock numa tela que ela já deixou (até o zoom nativo deixa uma faixa). O app detecta isso e reinicia a Dock, o que resolve.
 - 🧠 **Respeita você.** Se você redimensionar ou mover uma janela depois do ajuste, a sua escolha vale. Nada acontece enquanto um botão do mouse estiver pressionado.
 - 🙈 **Não mexe** em janelas minimizadas, em tela cheia, painéis, diálogos e apps excluídos.
 - 🪶 **Leve.** Orientado a eventos, sem polling. Medido num M4 Pro: 0% de CPU quando você não está usando o computador, ~1% de um núcleo enquanto o mouse se move (para antecipar a Dock), ~35 ms de CPU por troca de Dock e ~25–45 MB de memória.
@@ -50,6 +51,7 @@ Funciona com a Dock original da Apple, sem substituir, alterar o visual ou recri
   - *Maximizadas e encostadas na Dock* (padrão): também metades e terços lado a lado
   - *Também janelas movidas que alcançam a área da Dock*: também janelas que você arrastou um pouco para baixo
 - **Expandir janelas em telas sem Dock** · **Animar redimensionamento**
+- **Corrigir espaço da Dock travado (reinicia a Dock)**
 - **Aplicativos ignorados**: ignorar o app em primeiro plano ou escolher entre os apps em execução
 - **Iniciar junto com o macOS**
 
@@ -92,7 +94,9 @@ A investigação, as medições e as decisões técnicas estão detalhadas no [R
 - `NSScreen.visibleFrame` **acompanha** a Dock em tempo real (~200 ms).
 - A Dock **oculta** é localizada pelo `AXList` dela, que continua existindo logo além da borda da tela.
 - Cada evento gera uma reconciliação idempotente via API de Acessibilidade, com registros de *antes/depois* para restaurar os tamanhos exatos.
-- O app antecipa a chegada da Dock (~200 ms) para animar o encolhimento antes de os apps cortarem as janelas por conta própria.
+- O app começa a encolher as janelas quando o ponteiro para na borda (60 ms), antes de a Dock aparecer, para que os apps não as cortem por conta própria.
+- Cada app é ajustado em paralelo: um app lento para responder só atrasa a si mesmo.
+- Falhas do macOS tratadas: Dock visível sem espaço reservado (depois de sair da tela cheia) e espaço preso na tela errada (resolvido reiniciando a Dock). Um roteiro de testes (`Tools/edge-cases.sh`) cobre 17 cenários.
 - Há tratamento específico para as particularidades do Chromium e do Electron (Chrome, VS Code, Slack…).
 
 ## Licença

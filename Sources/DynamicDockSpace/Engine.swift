@@ -107,7 +107,9 @@ final class Engine {
             NSEvent.removeMonitor(m); pointerMonitor = nil
         }
     }
-    private var lastPrediction = Date.distantPast
+    /// Last display the Dock was predicted to arrive on. Only that display is ignored for 2 s (the Dock is already
+    /// there, detection just has not caught up): a quick move back to the other display must still be caught.
+    private var lastPrediction: (target: CGDirectDisplayID, at: Date)?
 
     /// "Only with more than one display" is on and a single display is connected.
     var isStandby: Bool { settings.onlyMultiMonitor && lastScreens.count < 2 }
@@ -116,7 +118,8 @@ final class Engine {
     /// call) for the Dock starting to move there. Its AXList jumps to the new display ~200 ms before visibleFrame
     /// changes — which is what makes every app clamp its windows abruptly. Shrinking first lets us animate it.
     private func startEdgeWatch(_ target: CGDirectDisplayID, _ edge: DockEdge) {
-        guard edgeWatch == nil, Date().timeIntervalSince(lastPrediction) > 2,
+        if let p = lastPrediction, p.target == target, Date().timeIntervalSince(p.at) < 2 { return }
+        guard edgeWatch == nil,
               settings.enabled, settings.animate, !isStandby, AXIsProcessTrusted(),
               settings.lastReservation(edge) != nil else { return }
         let started = Date()
@@ -126,7 +129,7 @@ final class Engine {
             guard Date().timeIntervalSince(started) < 2, let primary = self.lastScreens.first,
                   let s = self.lastScreens.first(where: { $0.id == target }) else { stop(); return }
             if let f = DockDetector.axListFrame(), DockDetector.screenFromAX(f, edge: edge, self.lastScreens)?.id == target {
-                stop(); self.lastPrediction = Date(); self.predictArrival(on: target); return
+                stop(); self.lastPrediction = (target, Date()); self.predictArrival(on: target); return
             }
             let c = NSEvent.mouseLocation
             if !Self.isNearEdge(CGPoint(x: c.x, y: primary.frame.height - c.y), s, edge) { stop() }
@@ -343,9 +346,16 @@ final class Engine {
         guard !jobs.isEmpty else { return }
         let groups = Array(Dictionary(grouping: jobs, by: { $0.app.pid }).values)
         let start = CFAbsoluteTimeGetCurrent()
+        let statsLock = NSLock(); var stats: [String] = []
         DispatchQueue.concurrentPerform(iterations: groups.count) { g in
             let group = groups[g]
             var last = group.map(\.from)
+            var steps = 0, total = 0.0, worst = 0.0, bailed = false
+            defer {
+                let line = String(format: "%@ ×%d: %d steps, avg %.1f ms, max %.1f ms%@", group[0].app.name, group.count, steps,
+                                  steps > 0 ? total / Double(steps) * 1000 : 0, worst * 1000, bailed ? ", too slow → jumped to the end" : "")
+                statsLock.lock(); stats.append(line); statsLock.unlock()
+            }
             while true {
                 let frameStart = CFAbsoluteTimeGetCurrent()
                 let t = (frameStart - start) / duration
@@ -367,11 +377,13 @@ final class Engine {
                     last[k] = r
                 }
                 let spent = CFAbsoluteTimeGetCurrent() - frameStart
+                steps += 1; total += spent; worst = max(worst, spent)
                 // An app this slow would only show a couple of jerky steps: let it jump to the end instead.
-                if spent > 0.08 { break }
+                if spent > 0.08 { bailed = true; break }
                 if spent < 1.0 / 120 { usleep(useconds_t((1.0 / 120 - spent) * 1_000_000)) }
             }
         }
+        Log.info(String(format: "animation %.0f ms (planned %.0f): ", (CFAbsoluteTimeGetCurrent() - start) * 1000, duration * 1000) + stats.joined(separator: " | "))
     }
 
     private func isRunning(_ pid: pid_t) -> Bool { kill(pid, 0) == 0 }
